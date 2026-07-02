@@ -9,6 +9,19 @@ from prophet import Prophet
 import ollama
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 import os
+import new_features
+plt.ioff()
+
+
+def show_plots_and_wait():
+    """
+    Muestra las figuras de Matplotlib y bloquea el agente hasta que el usuario
+    cierre todas las ventanas abiertas.
+    """
+    if plt.get_fignums():
+        print("🖼️  Cierra la(s) figura(s) para continuar...")
+        plt.show(block=True)
+        plt.close('all')
 
 # =============================
 # Configuración del modelo
@@ -38,6 +51,7 @@ try:
     print(f"   Columnas disponibles: {list(dtf.columns)}\n")
     print("📋 Primeras filas del dataset:")
     print(dtf.head(), "\n")
+    new_features.dtf = dtf
 
 except Exception as e:
     print(f"❌ Error al cargar {DATA_PATH}: {e}")
@@ -88,13 +102,18 @@ def sanitize_code(code: str) -> str:
 def code_exec(code: str) -> str:
     output = io.StringIO()
     code = sanitize_code(code.strip())
-    if not code.startswith("print(") or not code.endswith(")"):
-        return "Error: usa print(...) para mostrar resultados."
     if not is_valid_python(code):
         return "Error: código incompleto o inválido."
     with contextlib.redirect_stdout(output):
         try:
-            exec(code, globals())
+            tree = ast.parse(code, mode="exec")
+            if len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
+                expr = ast.Expression(tree.body[0].value)
+                result = eval(compile(expr, "<code_exec>", "eval"), globals())
+                if result is not None:
+                    print(result)
+            else:
+                exec(code, globals())
         except Exception as e:
             print(f"Error: {e}")
     return output.getvalue()
@@ -105,12 +124,12 @@ tool_code_exec = {
   'type':'function',
   'function':{
     'name': 'code_exec',
-    'description': 'Ejecuta código Python. Siempre usar print() para mostrar la salida.',
+    'description': 'Ejecuta código Python. Puede usar print(...) o una expresión simple como get_statistics(dtf["MW"]).',
     'parameters': {
       'type': 'object', 
       'required': ['code'],
       'properties': {
-        'code': {'type':'str', 'description':'código Python a ejecutar'},
+        'code': {'type':'string', 'description':'código Python a ejecutar'},
       }
     }
   }
@@ -154,10 +173,41 @@ def plot_data(columns=None, start_date=None, end_date=None, title="Gráfico de d
         plt.xlabel("Tiempo (15 min)")
         plt.ylabel("Potencia [MW]")
         plt.grid(True)
-        plt.show()
+        show_plots_and_wait()
         return f"Gráfico generado con columnas {columns or list(df.columns)}."
     except Exception as e:
         return f"Error al graficar: {e}"
+
+
+tool_plot_data = {
+  'type': 'function',
+  'function': {
+    'name': 'plot_data',
+    'description': 'Genera gráficos de una o varias columnas del dataset ya cargado, opcionalmente filtrando por fecha o rango de fechas.',
+    'parameters': {
+      'type': 'object',
+      'properties': {
+        'columns': {
+          'type': 'array',
+          'items': {'type': 'string'},
+          'description': 'Lista de columnas a graficar, por ejemplo ["MW"] o ["MW", "MW_P"].'
+        },
+        'start_date': {
+          'type': 'string',
+          'description': 'Fecha inicial o fecha única en formato YYYY-MM-DD.'
+        },
+        'end_date': {
+          'type': 'string',
+          'description': 'Fecha final en formato YYYY-MM-DD.'
+        },
+        'title': {
+          'type': 'string',
+          'description': 'Título del gráfico.'
+        }
+      }
+    }
+  }
+}
 
 
 
@@ -225,7 +275,7 @@ def predict_data(model="prophet", column=None, horizon=None, end_date=None):
             plt.ylabel(column)
             plt.grid(True)
             plt.legend()
-            plt.show()
+            show_plots_and_wait()
 
             out_df = forecast_pred.copy()
 
@@ -248,7 +298,7 @@ def predict_data(model="prophet", column=None, horizon=None, end_date=None):
             plt.ylabel(column)
             plt.grid(True)
             plt.legend()
-            plt.show()
+            show_plots_and_wait()
 
             out_df = forecast_df.copy()
 
@@ -320,10 +370,39 @@ dic_tools = {
     "plot_data": plot_data,
     "predict_data": predict_data
 }
+dic_tools.update(new_features.new_tools)
+globals().update(new_features.new_tools)
 
 # =============================
 # Ejecutor de herramientas
 # =============================
+def normalize_tool_args(t_name, t_inputs):
+    """
+    Normaliza argumentos de herramientas base y de new_features antes de ejecutar.
+    """
+    if t_name == "plot_data":
+        return normalize_plot_args(t_inputs)
+    if t_name == "code_exec":
+        if isinstance(t_inputs, dict):
+            return {"code": t_inputs.get("code", "")}
+        return t_inputs
+    if t_name == "predict_data":
+        t_inputs = normalize_predict_args(t_inputs)
+        if isinstance(t_inputs, dict):
+            t_inputs.setdefault("model", "prophet")
+            t_inputs.setdefault("horizon", 7)
+            if "column" not in t_inputs or t_inputs["column"] not in dtf.columns:
+                t_inputs["column"] = list(dtf.columns)[0]
+        return t_inputs
+    if t_name == "final_answer" and isinstance(t_inputs, dict) and "final_answer" in t_inputs:
+        return {"text": t_inputs["final_answer"]}
+
+    normalizer = new_features.normalizers.get(t_name)
+    if normalizer:
+        return normalizer(t_inputs)
+    return t_inputs
+
+
 def normalize_predict_args(t_inputs):
     """
     Corrige y normaliza argumentos comunes en predict_data.
@@ -368,20 +447,96 @@ def normalize_predict_args(t_inputs):
     return t_inputs
 
 
+def get_requested_column(query):
+    """
+    Extrae una columna del texto del usuario. Si no encuentra una, usa MW
+    cuando exista o la primera columna numérica disponible.
+    """
+    query_lower = query.lower()
+    for col in dtf.columns:
+        if col.lower() in query_lower:
+            return col
+
+    numeric_cols = list(dtf.select_dtypes(include="number").columns)
+    if "MW" in dtf.columns:
+        return "MW"
+    if numeric_cols:
+        return numeric_cols[0]
+    return list(dtf.columns)[0]
 
 
-def use_tool(agent_res: dict, dic_tools: dict) -> dict:
+def is_stat_plot_request(query):
+    """
+    Detecta peticiones que deben ir a stat_plotting, no a historical_hourly
+    ni a get_statistics.
+    """
+    query_lower = query.lower()
+    graph_terms = [
+        "grafica", "gráfica", "grafico", "gráfico", "graficar",
+        "grafique", "plot", "plotear", "plotea", "visualiza"
+    ]
+    stat_plot_terms = [
+        "histograma", "boxplot", "caja", "distribucion", "distribución",
+        "promedio horario", "perfil horario", "por hora", "hora pico",
+        "promedio diario", "perfil diario", "estadistica", "estadística"
+    ]
+
+    return any(term in query_lower for term in graph_terms) and any(term in query_lower for term in stat_plot_terms)
+
+
+def infer_stat_plot_args(query, t_inputs=None):
+    """
+    Convierte una petición en argumentos para stat_plotting.
+    """
+    t_inputs = dict(t_inputs or {}) if isinstance(t_inputs, dict) else {}
+    query_lower = query.lower()
+
+    if "column" not in t_inputs or t_inputs["column"] not in dtf.columns:
+        t_inputs["column"] = get_requested_column(query)
+
+    if "plot_type" not in t_inputs:
+        if "histograma" in query_lower:
+            t_inputs["plot_type"] = "histogram"
+        elif "boxplot" in query_lower or "caja" in query_lower:
+            t_inputs["plot_type"] = "boxplot"
+        elif "promedio diario" in query_lower or "perfil diario" in query_lower:
+            t_inputs["plot_type"] = "daily_profile"
+        elif "promedio horario" in query_lower or "perfil horario" in query_lower or "por hora" in query_lower or "hora pico" in query_lower:
+            t_inputs["plot_type"] = "hourly_profile"
+        else:
+            t_inputs["plot_type"] = "distribution"
+
+    return new_features.normalize_stat_plotting_args(t_inputs)
+
+
+def maybe_reroute_to_stat_plotting(t_name, t_inputs, user_query):
+    """
+    Si el modelo elige una herramienta de cálculo para una petición de gráfico
+    estadístico, redirige la llamada a stat_plotting.
+    """
+    if user_query and is_stat_plot_request(user_query) and t_name in ("get_statistics", "historical_hourly", "final_answer"):
+        return "stat_plotting", infer_stat_plot_args(user_query, t_inputs)
+    return t_name, t_inputs
+
+
+
+
+def use_tool(agent_res: dict, dic_tools: dict, user_query: str = "") -> dict:
     """
     Ejecuta las herramientas solicitadas por el modelo.
     - Soporta tanto tool_calls formales como JSON plano en content.
     - Incluye normalización automática de argumentos.
     """
     msg = agent_res["message"]
+    tool_calls = getattr(msg, "tool_calls", None)
+    if tool_calls is None and hasattr(msg, "get"):
+        tool_calls = msg.get("tool_calls")
+    content = msg.get("content", "") if hasattr(msg, "get") else getattr(msg, "content", "")
     res, t_name, t_inputs = "", "", ""
 
     # ✅ Caso 1: tool_calls formales (cuando Ollama estructura la llamada)
-    if hasattr(msg, "tool_calls") and msg.tool_calls:
-        for tool in msg.tool_calls:
+    if tool_calls:
+        for tool in tool_calls:
             t_name = tool["function"]["name"]
             raw_args = tool["function"]["arguments"]
 
@@ -391,24 +546,8 @@ def use_tool(agent_res: dict, dic_tools: dict) -> dict:
             except Exception:
                 t_inputs = raw_args
 
-            # 🔧 Normalización según la herramienta
-            if t_name == "load_csv":
-                t_inputs = normalize_csv_args(t_inputs)
-            elif t_name == "plot_data":
-                t_inputs = normalize_plot_args(t_inputs)
-            elif t_name == "code_exec":
-                if isinstance(t_inputs, dict):
-                    code = t_inputs.get("code", "")
-                    t_inputs = {"code": code}
-            elif t_name == "predict_data":
-                t_inputs = normalize_predict_args(t_inputs)
-                if isinstance(t_inputs, dict):
-                    t_inputs.setdefault("model", "prophet")
-                    t_inputs.setdefault("horizon", 7)
-                    if "column" not in t_inputs or t_inputs["column"] not in dtf.columns:
-                        t_inputs["column"] = list(dtf.columns)[0]
-            elif t_name == "final_answer" and isinstance(t_inputs, dict) and "final_answer" in t_inputs:
-                t_inputs = {"text": t_inputs["final_answer"]}
+            t_inputs = normalize_tool_args(t_name, t_inputs)
+            t_name, t_inputs = maybe_reroute_to_stat_plotting(t_name, t_inputs, user_query)
 
             # Ejecutar herramienta
             if f := dic_tools.get(t_name):
@@ -418,34 +557,35 @@ def use_tool(agent_res: dict, dic_tools: dict) -> dict:
                 except Exception as e:
                     cols = list(dtf.columns) if 'dtf' in globals() else 'No hay dataset cargado'
                     t_output = f"Error ejecutando {t_name}: {e}. Columnas disponibles: {cols}"
+                show_plots_and_wait()
                 print(f"📊 Resultado:\n{t_output}\n")
                 res = t_output
             else:
                 print(f"🤬 > {t_name} -> NotFound")
 
     # ✅ Caso 2: JSON plano en msg.content (ej: {"name": ..., "arguments": {...}})
-    elif msg.get("content", "") and msg["content"].strip().startswith("{"):
+    elif content and content.strip().startswith("{"):
         try:
-            tool_call = json.loads(msg["content"])
+            tool_call = json.loads(content)
             t_name = tool_call.get("name", "")
             t_inputs = tool_call.get("arguments", {})
 
-            # Normalizar predict_data si aplica
-            if t_name == "predict_data":
-                t_inputs = normalize_predict_args(t_inputs)
+            t_inputs = normalize_tool_args(t_name, t_inputs)
+            t_name, t_inputs = maybe_reroute_to_stat_plotting(t_name, t_inputs, user_query)
 
             if f := dic_tools.get(t_name):
                 print(f"🔧 > {t_name} -> Inputs: {t_inputs}")
                 res = f(**t_inputs) if isinstance(t_inputs, dict) else f(t_inputs)
+                show_plots_and_wait()
                 print(f"📊 Resultado:\n{res}\n")
             else:
                 res = f"Herramienta {t_name} no encontrada."
         except Exception as e:
-            res = f"⚠️ Error al interpretar JSON: {e}\nContenido: {msg.get('content')}"
+            res = f"⚠️ Error al interpretar JSON: {e}\nContenido: {content}"
 
     # ✅ Caso 3: mensaje normal (texto plano sin tool)
-    elif msg.get("content", ""):
-        res = msg["content"]
+    elif content:
+        res = content
         print(f"💬 {res}")
 
     return {"res": res, "tool_used": t_name, "inputs_used": t_inputs}
@@ -465,11 +605,11 @@ def run_agent(llm, messages, available_tools):
                 tools=[v for v in available_tools.values()]
             )
 
-            dic_res = use_tool(agent_res, dic_tools)
+            dic_res = use_tool(agent_res, dic_tools, user_query=messages[-1]["content"])
             res, tool_used, inputs_used = dic_res["res"], dic_res["tool_used"], dic_res["inputs_used"]
 
           
-            if tool_used in ("code_exec", "plot_data"):
+            if tool_used in ("code_exec", "plot_data", "get_statistics", "historical_hourly", "stat_plotting"):
                 used_compute = True
 
             user_query = messages[-1]["content"].lower()
@@ -483,7 +623,7 @@ def run_agent(llm, messages, available_tools):
                 print("⚠️ > El modelo intentó responder sin calcular. Reintentando...")
                 messages.append({
                     "role": "user", 
-                    "content": "Debes usar code_exec o plot_data antes de final_answer."
+                    "content": "Debes usar code_exec, plot_data, get_statistics, historical_hourly o stat_plotting antes de final_answer."
                 })
                 tool_used = ""
                 continue
@@ -527,7 +667,10 @@ Herramientas disponibles:
 1. **code_exec** → Ejecuta código Python con `print(...)` (por ejemplo, cálculos, estadísticas, correlaciones).
 2. **plot_data** → Genera gráficos (por ejemplo, tendencias diarias o comparaciones MW vs MW_P).
 3. **predict_data** → Predice valores futuros usando Prophet o ARIMA (por ejemplo, los próximos días de MW).
-4. **final_answer** → Explica resultados o responde en lenguaje natural.
+4. **get_statistics** → Calcula estadísticas descriptivas de `MW` o `MW_P`. No genera gráficos.
+5. **historical_hourly** → Calcula el promedio histórico por hora del día e identifica horas pico. No genera gráficos.
+6. **stat_plotting** → Genera solo gráficos estadísticos: distribución, histograma, boxplot, promedio horario o promedio diario.
+7. **final_answer** → Explica resultados o responde en lenguaje natural.
 
 Restricciones:
 - No cargues ni reemplaces el dataset (ya está cargado como `dtf`).
@@ -535,12 +678,19 @@ Restricciones:
 - Siempre usa los nombres reales de columnas.
 - Usa comillas dobles en nombres de columnas, ej: `dtf["MW"]`.
 - Nunca uses `pd.read_csv()` dentro de `code_exec`.
+- Si el usuario pide calcular estadísticas o promedio horario sin pedir explícitamente gráficos, NO uses herramientas de gráficos.
+- Si el usuario pide graficar estadísticas, perfiles horarios, histograma, boxplot o distribución, usa `stat_plotting`.
+- Si el usuario pide graficar la serie temporal real por fecha/rango, usa `plot_data`.
 - Si el usuario pide una fecha o rango que no existe, informa el error con `final_answer`.
 
 Ejemplos de comportamiento esperado:
 - “¿Cuál es el promedio de MW?” → usa `code_exec` con `print(dtf["MW"].mean())`.
 - “Grafica el 2024-09-06” → usa `plot_data` con `columns=["MW"]`, `start_date="2024-09-06"`, `end_date="2024-09-06"`.
 - “Predice MW para los próximos 2 días con Prophet” → usa `predict_data` con `{"model": "prophet", "column": "MW", "horizon": 2}`.
+- “Dame estadísticas de MW” → usa `get_statistics` con `{"column": "MW"}`.
+- “Calcula el promedio histórico por hora de MW” → usa `historical_hourly` con `{"column": "MW"}`.
+- “Grafica el histograma de MW” → usa `stat_plotting` con `{"column": "MW", "plot_type": "histogram"}`.
+- “Grafica el promedio histórico por hora de MW” → usa `stat_plotting` con `{"column": "MW", "plot_type": "hourly_profile"}`.
 - “¿Qué columnas tiene el archivo?” → usa solo `final_answer` describiendo las columnas.
 
 Tu prioridad es responder de forma útil, precisa y sin inventar resultados.
@@ -556,12 +706,35 @@ while True:
         break
     messages.append({"role": "user", "content": q})
     available_tools = {
-        "final_answer": {"type": "function", "function": {"name": "final_answer", "description": "Respuesta textual"}},
-        "code_exec": {"type": "function", "function": {"name": "code_exec", "description": "Ejecuta código con print()"}},
-        "plot_data": {"type": "function", "function": {"name": "plot_data", "description": "Grafica columnas"}},
-        "predict_data": {"type": "function", "function": {"name": "predict_data", "description": "Predicción con Prophet o ARIMA"}}
+        "final_answer": tool_final_answer,
+        "code_exec": tool_code_exec,
+        "plot_data": tool_plot_data,
+        "predict_data": tool_predict_data
     }
+    for tool_schema in new_features.new_tools_schemas:
+        available_tools[tool_schema["function"]["name"]] = tool_schema
+
+    if is_stat_plot_request(q):
+        t_inputs = infer_stat_plot_args(q)
+        print(f"🔧 > stat_plotting -> Inputs: {t_inputs}")
+        try:
+            dic_res = {
+                "res": dic_tools["stat_plotting"](**t_inputs),
+                "tool_used": "stat_plotting",
+                "inputs_used": t_inputs
+            }
+        except Exception as e:
+            dic_res = {
+                "res": f"Error ejecutando stat_plotting: {e}. Columnas disponibles: {list(dtf.columns)}",
+                "tool_used": "stat_plotting",
+                "inputs_used": t_inputs
+            }
+        show_plots_and_wait()
+        print("👽 >", dic_res["res"], "\n")
+        messages.append({"role": "assistant", "content": dic_res["res"]})
+        continue
+
     res = ollama.chat(model=llm, messages=messages, tools=[v for v in available_tools.values()], format="json")
-    dic_res = use_tool(res, dic_tools)
+    dic_res = use_tool(res, dic_tools, user_query=q)
     print("👽 >", dic_res["res"], "\n")
     messages.append({"role": "assistant", "content": dic_res["res"]})
